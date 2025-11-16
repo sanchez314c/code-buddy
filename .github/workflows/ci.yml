@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+      - name: Lint scripts
+        run: |
+          shellcheck code-buddy
+          shellcheck portfolio-pulse.sh
+          shellcheck install.sh
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Make executable
+        run: chmod +x code-buddy portfolio-pulse.sh install.sh
+      - name: Test version
+        run: ./code-buddy version
+      - name: Test help
+        run: ./code-buddy help
+      - name: Test status with no config
+        run: ./code-buddy status || true
