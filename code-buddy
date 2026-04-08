@@ -1,0 +1,332 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+#  CODE BUDDY — Portfolio management for AI-assisted developers
+#  https://github.com/sanchez314c/code-buddy
+# ═══════════════════════════════════════════════════════════════
+
+VERSION="1.0.0"
+CONFIG_DIR="${HOME}/.code-buddy"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# Colors
+C='\033[0;36m' G='\033[0;32m' Y='\033[0;33m' R='\033[0;31m' D='\033[2m' B='\033[1m' N='\033[0m'
+
+# ── Config ────────────────────────────────────────────────────
+
+load_config() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" << 'EOF'
+{
+  "portfolio_dir": "",
+  "active_cap": 7,
+  "pulse_days": 7,
+  "folders": {
+    "icebox": "00-ICEBOX",
+    "workbench": "00-WORKBENCH",
+    "active": "00-ACTIVE",
+    "queue": "00-QUEUE",
+    "shipped": "00-GITHUB",
+    "other": "00-OTHER"
+  }
+}
+EOF
+  fi
+
+  PORTFOLIO=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('portfolio_dir',''))" 2>/dev/null)
+  ACTIVE_CAP=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('active_cap',7))" 2>/dev/null)
+  if [ -z "$PORTFOLIO" ] || [ ! -d "$PORTFOLIO" ]; then
+    echo -e "${R}Portfolio directory not set or doesn't exist.${N}"
+    echo "Run: code-buddy config set portfolio_dir /path/to/your/repos"
+    return 1
+  fi
+}
+
+# ── Scan ──────────────────────────────────────────────────────
+
+cmd_scan() {
+  load_config || return 1
+  echo -e "${C}Scanning portfolio: ${PORTFOLIO}${N}"
+  "$SCRIPT_DIR/portfolio-pulse.sh"
+  echo -e "${G}Manifest and activity report updated.${N}"
+}
+
+# ── Pulse ─────────────────────────────────────────────────────
+
+cmd_pulse() {
+  load_config || return 1
+  "$SCRIPT_DIR/portfolio-pulse.sh" --quick
+}
+
+# ── Status ────────────────────────────────────────────────────
+
+cmd_status() {
+  load_config || return 1
+
+  local active
+  active=$(find "$PORTFOLIO/00-ACTIVE" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  local workbench
+  workbench=$(find "$PORTFOLIO/00-WORKBENCH" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  local queue
+  queue=$(find "$PORTFOLIO/00-QUEUE" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  local icebox
+  icebox=$(find "$PORTFOLIO/00-ICEBOX" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  local shipped=0
+  for cat_dir in "$PORTFOLIO/00-GITHUB"/*/; do
+    [ -d "$cat_dir" ] && shipped=$((shipped + $(find "$cat_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)))
+  done
+
+  echo -e "${B}Portfolio Status${N}"
+  echo -e "─────────────────────────────────"
+  echo -e "  ${G}ACTIVE:${N}    $active / $ACTIVE_CAP"
+  echo -e "  ${Y}WORKBENCH:${N} $workbench"
+  echo -e "  ${C}QUEUE:${N}     $queue"
+  echo -e "  ${D}ICEBOX:${N}    $icebox"
+  echo -e "  ${G}SHIPPED:${N}   $shipped"
+  echo -e "─────────────────────────────────"
+  local total=$((active + workbench + queue + icebox + shipped))
+  echo -e "  Total:     $total repos"
+
+  if [ "$active" -gt "$ACTIVE_CAP" ]; then
+    echo ""
+    echo -e "  ${R}WARNING: ACTIVE ($active) exceeds cap ($ACTIVE_CAP)${N}"
+    echo -e "  ${R}Move $((active - ACTIVE_CAP)) repos to WORKBENCH${N}"
+  fi
+}
+
+# ── Move ──────────────────────────────────────────────────────
+
+cmd_move() {
+  load_config || return 1
+  local repo_name="$1"
+  local target_stage="$2"
+
+  if [ -z "$repo_name" ] || [ -z "$target_stage" ]; then
+    echo "Usage: code-buddy move <repo-name> <stage>"
+    echo "Stages: icebox, workbench, active, queue, shipped"
+    return 1
+  fi
+
+  # Input sanitization: reject path traversal and special chars
+  if [[ "$repo_name" == *"/"* ]] || [[ "$repo_name" == *".."* ]]; then
+    echo -e "${R}Invalid repo name. Use the directory name only, no paths.${N}"
+    return 1
+  fi
+
+  # Map stage to folder
+  local target_folder=""
+  case "$target_stage" in
+    icebox)    target_folder="00-ICEBOX" ;;
+    workbench) target_folder="00-WORKBENCH" ;;
+    active)    target_folder="00-ACTIVE" ;;
+    queue)     target_folder="00-QUEUE" ;;
+    shipped)   target_folder="00-GITHUB" ;;
+    other)     target_folder="00-OTHER" ;;
+    *)         echo -e "${R}Unknown stage: $target_stage${N}"; return 1 ;;
+  esac
+
+  # Check active cap
+  if [ "$target_stage" = "active" ]; then
+    local active_count
+    active_count=$(find "$PORTFOLIO/00-ACTIVE" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    if [ "$active_count" -ge "$ACTIVE_CAP" ]; then
+      echo -e "${R}ACTIVE is full ($active_count/$ACTIVE_CAP). Move something out first.${N}"
+      echo "Current ACTIVE repos:"
+      for entry in "$PORTFOLIO/00-ACTIVE"/*/; do
+        [ -d "$entry" ] && echo "  $(basename "$entry")"
+      done
+      return 1
+    fi
+  fi
+
+  # Find the repo
+  local found=""
+  for folder in 00-ACTIVE 00-WORKBENCH 00-QUEUE 00-ICEBOX 00-OTHER; do
+    if [ -d "$PORTFOLIO/$folder/$repo_name" ]; then
+      found="$PORTFOLIO/$folder/$repo_name"
+      break
+    fi
+  done
+  # Check GITHUB subcategories
+  if [ -z "$found" ]; then
+    for cat_dir in "$PORTFOLIO/00-GITHUB"/*/; do
+      if [ -d "$cat_dir/$repo_name" ]; then
+        found="$cat_dir/$repo_name"
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$found" ]; then
+    echo -e "${R}Repo '$repo_name' not found in any folder.${N}"
+    return 1
+  fi
+
+  local source_folder
+  source_folder=$(basename "$(dirname "$found")")
+  if [ "$source_folder" = "$target_folder" ]; then
+    echo -e "${Y}$repo_name is already in $target_stage.${N}"
+    return 0
+  fi
+
+  if mv "$found" "$PORTFOLIO/$target_folder/" 2>/dev/null; then
+    echo -e "${G}Moved $repo_name: $source_folder → $target_folder${N}"
+  else
+    echo -e "${R}Failed to move $repo_name. Check permissions.${N}"
+    return 1
+  fi
+}
+
+# ── Ready ─────────────────────────────────────────────────────
+
+cmd_ready() {
+  load_config || return 1
+  echo -e "${B}QUEUE repos ready for pipeline:${N}"
+  echo ""
+
+  for repo in "$PORTFOLIO/00-QUEUE"/*/; do
+    [ ! -d "$repo" ] && continue
+    local name
+    name=$(basename "$repo")
+    local has_readme
+    has_readme=$( [ -f "$repo/README.md" ] && echo "Y" || echo "-" )
+    local has_tests
+    has_tests=$( [ -d "$repo/tests" ] || [ -d "$repo/__tests__" ] && echo "Y" || echo "-" )
+    local has_claude
+    has_claude=$( [ -f "$repo/CLAUDE.md" ] && echo "Y" || echo "-" )
+    local has_license
+    has_license=$( [ -f "$repo/LICENSE" ] && echo "Y" || echo "-" )
+    local has_git
+    has_git=$( [ -d "$repo/.git" ] && echo "Y" || echo "-" )
+
+    local score=0
+    [ "$has_readme" = "Y" ] && score=$((score+1))
+    [ "$has_tests" = "Y" ] && score=$((score+1))
+    [ "$has_claude" = "Y" ] && score=$((score+1))
+    [ "$has_license" = "Y" ] && score=$((score+1))
+    [ "$has_git" = "Y" ] && score=$((score+1))
+
+    local color="$R"
+    [ "$score" -ge 3 ] && color="$Y"
+    [ "$score" -ge 4 ] && color="$G"
+
+    printf "  ${color}[%d/5]${N} %-25s README:%s Tests:%s CLAUDE:%s License:%s Git:%s\n" \
+      "$score" "$name" "$has_readme" "$has_tests" "$has_claude" "$has_license" "$has_git"
+  done
+}
+
+# ── Config ────────────────────────────────────────────────────
+
+cmd_config() {
+  local action="$1"
+  local key="$2"
+  local value="$3"
+
+  case "$action" in
+    set)
+      if [ -z "$key" ] || [ -z "$value" ]; then
+        echo "Usage: code-buddy config set <key> <value>"
+        return 1
+      fi
+      mkdir -p "$CONFIG_DIR"
+      python3 -c "
+import json
+with open('$CONFIG_FILE') as f: d=json.load(f)
+d['$key']=$value if '$value'.isdigit() else '$value'
+with open('$CONFIG_FILE','w') as f: json.dump(d,f,indent=2)
+print(f'Set $key = $value')
+"
+      ;;
+    show)
+      python3 -m json.tool < "$CONFIG_FILE" 2>/dev/null
+      ;;
+    *)
+      echo "Usage: code-buddy config [set|show]"
+      ;;
+  esac
+}
+
+# ── Hook ──────────────────────────────────────────────────────
+
+cmd_hook() {
+  local action="${1:-install}"
+
+  case "$action" in
+    install)
+      echo -e "${C}Installing Claude Code session hook...${N}"
+      # The hook adds portfolio context to every session start
+      mkdir -p "$CONFIG_DIR"
+      cat > "$CONFIG_DIR/session-hook.sh" << 'HOOKEOF'
+#!/bin/bash
+# Code Buddy session hook — runs on Claude Code session start
+CONFIG="$HOME/.code-buddy/config.json"
+[ ! -f "$CONFIG" ] && exit 0
+PORTFOLIO=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('portfolio_dir',''))" 2>/dev/null)
+[ -z "$PORTFOLIO" ] && exit 0
+
+# Show quick status
+ACTIVE=$(find "$PORTFOLIO/00-ACTIVE" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+QUEUE=$(find "$PORTFOLIO/00-QUEUE" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+echo "Code Buddy: $ACTIVE active | $QUEUE queued | Manifest: $PORTFOLIO/MANIFEST.md"
+HOOKEOF
+      chmod +x "$CONFIG_DIR/session-hook.sh"
+      echo -e "${G}Hook installed at $CONFIG_DIR/session-hook.sh${N}"
+      echo "Add to Claude Code settings.json or reference in CLAUDE.md"
+      ;;
+    *)
+      echo "Usage: code-buddy hook [install]"
+      ;;
+  esac
+}
+
+# ── Triage ────────────────────────────────────────────────────
+
+cmd_triage() {
+  load_config || return 1
+  echo -e "${B}Current ACTIVE repos:${N}"
+  echo ""
+  local i=1
+  for repo in "$PORTFOLIO/00-ACTIVE"/*/; do
+    [ ! -d "$repo" ] && continue
+    local name
+    name=$(basename "$repo")
+    echo -e "  ${C}$i)${N} $name"
+    i=$((i+1))
+  done
+  echo ""
+  echo -e "Cap: ${Y}$ACTIVE_CAP${N} | Current: ${C}$((i-1))${N}"
+  echo ""
+  echo "Use 'code-buddy move <repo> workbench' to move repos out."
+  echo "Use 'code-buddy move <repo> active' to move repos in."
+}
+
+# ── Main ──────────────────────────────────────────────────────
+
+case "${1:-help}" in
+  scan)    cmd_scan ;;
+  pulse)   cmd_pulse ;;
+  status)  cmd_status ;;
+  move)    cmd_move "$2" "$3" ;;
+  ready)   cmd_ready ;;
+  config)  cmd_config "$2" "$3" "$4" ;;
+  hook)    cmd_hook "$2" ;;
+  triage)  cmd_triage ;;
+  version) echo "code-buddy $VERSION" ;;
+  help|*)
+    echo -e "${B}Code Buddy${N} $VERSION — Portfolio management for AI-assisted developers"
+    echo ""
+    echo "Commands:"
+    echo "  scan       Full portfolio scan, generate MANIFEST.md + RECENT-ACTIVITY.md"
+    echo "  pulse      Quick: what changed in the last 7 days"
+    echo "  status     One-line portfolio health summary"
+    echo "  move       Move a repo between stages (code-buddy move <repo> <stage>)"
+    echo "  ready      Show which QUEUE repos are pipeline-ready"
+    echo "  triage     Interactive: review and adjust your ACTIVE repos"
+    echo "  config     Set/show configuration (code-buddy config set <key> <value>)"
+    echo "  hook       Install Claude Code session hook"
+    echo "  version    Show version"
+    echo ""
+    echo "Stages: icebox, workbench, active, queue, shipped, other"
+    ;;
+esac
